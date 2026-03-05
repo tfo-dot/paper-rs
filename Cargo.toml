@@ -1,0 +1,21 @@
+[package]
+name = "paper-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The graphics engine
+wgpu = "28.0" 
+# Wayland integration
+smithay-client-toolkit = "0.19" 
+wayland-client = "0.31"
+# For hot-reloading your shader file
+notify = "6.1"
+# Async runtime for WGPU
+pollster = "0.3"
+winit = { version = "0.30.8", features = ["android-native-activity"] }
+env_logger = "0.11"
+bytemuck = "1.25.0"
+libpulse-binding = "2.30.1"
+libpulse-simple-binding = "2.29.0"
+realfft = "3.5.0"
