@@ -1,13 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
+use layershellev::id::Id;
+use layershellev::reexport::{Anchor, Layer};
+use layershellev::{DispatchMessage, LayerShellEvent, RefreshRequest, ReturnData, WindowState};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use realfft::RealFftPlanner;
-use winit::{
-    application::ApplicationHandler,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop, OwnedDisplayHandle},
-    platform::wayland::WindowAttributesExtWayland,
-    window::{Window, WindowId},
-};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -20,10 +17,8 @@ struct Uniforms {
 }
 
 struct State {
-    window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    size: winit::dpi::PhysicalSize<u32>,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
     render_pipeline: wgpu::RenderPipeline,
@@ -32,26 +27,36 @@ struct State {
     uniform_buffer: wgpu::Buffer,
     fft_buffer: wgpu::Buffer,
     num_bins: u32,
+    size: (u32, u32),
 }
 
 impl State {
-    async fn new(_display: OwnedDisplayHandle, window: Arc<Window>) -> State {
-        let instance = wgpu::Instance::new(
-            &wgpu::InstanceDescriptor::default(), // wgpu::InstanceDescriptor::default().with_display_handle(Box::new(display)),
-        );
+    async fn new(
+        display_handle: raw_window_handle::RawDisplayHandle,
+        window_handle: raw_window_handle::RawWindowHandle,
+        size: (u32, u32),
+    ) -> State {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+
+        let surface = unsafe {
+            instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: display_handle,
+                    raw_window_handle: window_handle,
+                })
+                .expect("Failed to create surface")
+        };
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .unwrap();
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor::default())
             .await
             .unwrap();
 
-        let size = window.inner_size();
-
-        let surface = instance.create_surface(window.clone()).unwrap();
         let cap = surface.get_capabilities(&adapter);
         let surface_format = cap.formats[0];
 
@@ -158,10 +163,8 @@ impl State {
         });
 
         let state = State {
-            window,
             device,
             queue,
-            size,
             surface,
             surface_format,
             render_pipeline,
@@ -170,38 +173,28 @@ impl State {
             uniform_buffer: uniform_buffer,
             fft_buffer: fft_buffer,
             num_bins: num_bins,
+            size,
         };
 
         // Configure surface for the first time
-        state.configure_surface();
+        state.configure_surface(size);
 
         state
     }
 
-    fn get_window(&self) -> &Window {
-        &self.window
-    }
-
-    fn configure_surface(&self) {
+    fn configure_surface(&self, size: (u32, u32)) {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: self.surface_format,
             // Request compatibility with the sRGB-format texture view we‘re going to create later.
             view_formats: vec![self.surface_format.add_srgb_suffix()],
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            width: self.size.width,
-            height: self.size.height,
+            width: size.0,
+            height: size.1,
             desired_maximum_frame_latency: 2,
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: wgpu::PresentMode::Fifo,
         };
         self.surface.configure(&self.device, &surface_config);
-    }
-
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        self.size = new_size;
-
-        // reconfigure the surface
-        self.configure_surface();
     }
 
     fn render(&mut self, current_spectrum: &[f32]) {
@@ -216,7 +209,7 @@ impl State {
         let normalized_vol = (rms * 10.0).clamp(0.0, 1.0);
 
         let uniforms = Uniforms {
-            resolution: [self.size.width as f32, self.size.height as f32],
+            resolution: [self.size.0 as f32, self.size.1 as f32],
             time: elapsed,
             num_bins: self.num_bins as f32,
             intensity: normalized_vol,
@@ -236,10 +229,14 @@ impl State {
             .write_buffer(&self.fft_buffer, 0, bytemuck::cast_slice(&safe_spectrum));
 
         // 3. Render Pass
-        let surface_texture = self
-            .surface
-            .get_current_texture()
-            .expect("Failed to acquire next surface texture");
+        let st = self.surface.get_current_texture();
+
+        if st.is_err() {
+            return;
+        }
+
+        let surface_texture = st.expect("unreachable");
+
         let texture_view = surface_texture.texture.create_view(&Default::default());
         let mut encoder = self
             .device
@@ -254,9 +251,9 @@ impl State {
                     view: &texture_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
+                    ops: Operations {
+                        load: LoadOp::Clear(wgpu::Color::BLACK),
+                        store: StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
@@ -274,98 +271,13 @@ impl State {
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
     }
-
-    fn reload_shader(&mut self, new_source: &str) {
-        let shader = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Reloaded Shader"),
-                source: wgpu::ShaderSource::Wgsl(new_source.into()),
-            });
-
-        let bind_group_layout =
-            self.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("Visualizer Bind Group Layout"),
-                    entries: &[
-                        // Binding 0: Uniforms
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        // Binding 1: FFT Storage Array (Read-only)
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-
-        let render_pipeline_layout =
-            self.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Render Pipeline Layout"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    immediate_size: 0,
-                });
-
-        self.render_pipeline =
-            self.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("Render Pipeline"),
-                    layout: Some(&render_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &shader,
-                        entry_point: Some("fs_main"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: self.surface_format,
-                            blend: Some(wgpu::BlendState::REPLACE),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                });
-    }
-}
-
-use notify::{RecursiveMode, Watcher};
-use std::sync::Mutex;
-use std::sync::mpsc::{Receiver, channel};
-
-struct App {
-    states: HashMap<WindowId, State>,
-    rx: Receiver<()>,                     // Receiver for file change events
-    _watcher: notify::RecommendedWatcher, // Keep watcher alive
-    spectrum_source: Arc<Mutex<Vec<f32>>>,
-    smoothed_fft: Vec<f32>,
 }
 
 use libpulse_binding::sample;
 use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
+use std::sync::Mutex;
+use wgpu::{LoadOp, Operations, StoreOp};
 
 use libpulse_binding::def::BufferAttr;
 
@@ -442,107 +354,104 @@ fn setup_audio() -> Arc<Mutex<Vec<f32>>> {
     spectrum
 }
 
-impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        for monitor in event_loop.available_monitors() {
-            let monitor_name = monitor.name().unwrap_or_else(|| "Unknown".into());
-            println!("Creating wallpaper window for: {}", monitor_name);
-
-            let window_attributes = Window::default_attributes()
-                .with_title("rw_win")
-                .with_name(
-                    format!("wp_{}", monitor_name),
-                    <&str as Into<String>>::into(""),
-                )
-                .with_min_inner_size(monitor.size())
-                .with_max_inner_size(monitor.size());
-
-            let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
-
-            let state = pollster::block_on(State::new(
-                event_loop.owned_display_handle(),
-                window.clone(),
-            ));
-
-            self.states.insert(window.id(), state);
-        }
-    }
-
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        let raw_spectrum = self.spectrum_source.lock().unwrap().clone();
-
-        self.update_fft(raw_spectrum);
-
-        if let Some(state) = self.states.get_mut(&id) {
-            match event {
-                WindowEvent::RedrawRequested => {
-                    state.render(&self.smoothed_fft);
-                    state.get_window().request_redraw();
-                }
-                WindowEvent::Resized(size) => state.resize(size),
-                WindowEvent::CloseRequested => {
-                    self.states.remove(&id);
-                    if self.states.is_empty() {
-                        event_loop.exit();
-                    }
-                }
-                _ => (),
-            }
-        }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if self.rx.try_recv().is_ok() {
-            if let Ok(new_code) = std::fs::read_to_string("src/shader.wgsl") {
-                for state in self.states.values_mut() {
-                    state.reload_shader(&new_code);
-                }
-            }
-        }
-    }
-}
-
-impl App {
-    fn update_fft(&mut self, new_data: Vec<f32>) {
-        if self.smoothed_fft.len() != new_data.len() {
-            self.smoothed_fft = vec![0.0; new_data.len()];
-        }
-
-        for i in 0..new_data.len() {
-            let target = new_data[i];
-
-            if target > self.smoothed_fft[i] {
-                self.smoothed_fft[i] = target; // Instant "pop"
-            } else {
-                self.smoothed_fft[i] *= 0.92; // 8% decay per frame (adjust for "fun")
-            }
-        }
-    }
-}
-
 fn main() {
-    let (tx, rx) = channel();
+    let mut states: HashMap<Id, State> = HashMap::new();
+    let mut last_update: HashMap<Id, std::time::Instant> = HashMap::new();
+    let spectrum_source = setup_audio();
+    let mut smooth_fft = vec![];
 
-    let mut watcher = notify::recommended_watcher(move |res| {
-        if let Ok(_) = res {
-            println!("File update, reloading shader");
-            let _ = tx.send(());
-        }
-    })
-    .unwrap();
+    let target_fps = 45.0;
+    let frame_duration = std::time::Duration::from_secs_f32(1.0 / target_fps);
 
-    watcher
-        .watch("src/shader.wgsl".as_ref(), RecursiveMode::NonRecursive)
+    let ev: WindowState<()> = WindowState::new("paper-rs")
+        .with_allscreens()
+        .with_layer(Layer::Background)
+        .with_use_display_handle(true)
+        .with_exclusive_zone(-1)
+        .with_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right) // This stretches it to fill the monitor
+        .build()
         .unwrap();
 
-    let event_loop = EventLoop::new().unwrap();
-    let mut app = App {
-        states: HashMap::new(),
-        rx,
-        _watcher: watcher,
-        spectrum_source: setup_audio(),
-        smoothed_fft: vec![],
-    };
+    ev.running(move |event, ws, idx| match event {
+        LayerShellEvent::InitRequest => ReturnData::RequestBind,
+        LayerShellEvent::BindProvide(_globals, _qh) => {
+            let display_handle = ws.display_handle().unwrap().clone().as_raw();
 
-    event_loop.run_app(&mut app).unwrap();
+            for unit in ws.get_unit_iter() {
+                let window_handle = unit.window_handle().unwrap().as_raw();
+                let size = unit.get_size();
+
+                if size.0 == 0 || size.1 == 0 {
+                    continue;
+                }
+
+                let state = pollster::block_on(State::new(display_handle, window_handle, size));
+
+                states.insert(unit.id(), state);
+            }
+
+            ReturnData::RequestCompositor
+        }
+        LayerShellEvent::RequestMessages(DispatchMessage::RequestRefresh {
+            width,
+            height,
+            scale_float: _,
+            is_created: _,
+        }) => {
+            if let Some(id) = idx {
+                // 1. Lazy Initialization: Create state if it doesn't exist yet
+                if !states.contains_key(&id) && *width > 0 && *height > 0 {
+                    let display_handle = ws.display_handle().unwrap().clone().as_raw();
+                    let unit = ws.get_unit_with_id(id).unwrap();
+                    let window_handle = unit.window_handle().unwrap().as_raw();
+
+                    let state = pollster::block_on(State::new(
+                        display_handle,
+                        window_handle,
+                        (*width, *height),
+                    ));
+                    states.insert(id, state);
+                    last_update.insert(id, std::time::Instant::now());
+                }
+
+                // 2. Render logic
+                if let Some(state) = states.get_mut(&id) {
+                    // Ensure wgpu surface matches the new anchored size
+                    if state.size != (*width, *height) {
+                        state.size = (*width, *height);
+                        state.configure_surface((*width, *height));
+                    }
+
+                    let raw = spectrum_source.lock().unwrap().clone();
+                    update_fft(&mut smooth_fft, raw);
+
+                    if last_update.get(&id).expect("NO DATA LOL").elapsed() >= frame_duration {
+                        state.render(&smooth_fft);
+                        last_update.insert(id, std::time::Instant::now());
+                    }
+
+                    ws.request_refresh(id, RefreshRequest::NextFrame);
+                }
+            }
+            ReturnData::None
+        }
+        _ => ReturnData::None,
+    })
+    .unwrap();
+}
+
+fn update_fft(smoothed_fft: &mut Vec<f32>, new_data: Vec<f32>) {
+    if smoothed_fft.len() != new_data.len() {
+        *smoothed_fft = vec![0.0; new_data.len()];
+    }
+
+    for i in 0..new_data.len() {
+        let target = new_data[i];
+
+        if target > smoothed_fft[i] {
+            smoothed_fft[i] = target;
+        } else {
+            smoothed_fft[i] *= 0.92;
+        }
+    }
 }
