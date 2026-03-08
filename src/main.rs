@@ -26,8 +26,9 @@ struct State {
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     fft_buffer: wgpu::Buffer,
-    num_bins: u32,
     size: (u32, u32),
+    uniform_data: Uniforms,
+    smooth_fft: Vec<f32>,
 }
 
 impl State {
@@ -162,6 +163,8 @@ impl State {
             cache: None,
         });
 
+        let smooth_fft = vec![0.0; num_bins as usize];
+
         let state = State {
             device,
             queue,
@@ -169,17 +172,30 @@ impl State {
             surface_format,
             render_pipeline,
             start_time: std::time::Instant::now(),
-            bind_group: bind_group,
-            uniform_buffer: uniform_buffer,
-            fft_buffer: fft_buffer,
-            num_bins: num_bins,
+            bind_group,
+            uniform_buffer,
+            fft_buffer,
             size,
+            uniform_data: Uniforms {
+                resolution: [size.0 as f32, size.1 as f32],
+                time: 0.0,
+                num_bins: num_bins as f32,
+                intensity: 0.0,
+                _padding: [0.0; 3],
+            },
+            smooth_fft,
         };
 
         // Configure surface for the first time
         state.configure_surface(size);
 
         state
+    }
+
+    fn update_fft(&mut self, new_data: &[f32]) {
+        for (s, &n) in self.smooth_fft.iter_mut().zip(new_data.iter()) {
+            *s = f32::max(n, *s * 0.92);
+        }
     }
 
     fn configure_surface(&self, size: (u32, u32)) {
@@ -197,36 +213,35 @@ impl State {
         self.surface.configure(&self.device, &surface_config);
     }
 
-    fn render(&mut self, current_spectrum: &[f32]) {
+    fn render(&mut self) {
         let elapsed = self.start_time.elapsed().as_secs_f32();
 
         // Calculate raw energy
-        let sum_sq: f32 = current_spectrum.iter().map(|&s| s * s).sum();
-        let rms = (sum_sq / current_spectrum.len() as f32).sqrt();
+        let sum_sq: f32 = self.smooth_fft.iter().map(|&s| s * s).sum();
+        let rms = (sum_sq / self.smooth_fft.len() as f32).sqrt();
 
         // Map RMS to a usable 0.0-1.0 intensity
         // Adjust 10.0 lower if it's still "exploding" too often
         let normalized_vol = (rms * 10.0).clamp(0.0, 1.0);
 
-        let uniforms = Uniforms {
-            resolution: [self.size.0 as f32, self.size.1 as f32],
-            time: elapsed,
-            num_bins: self.num_bins as f32,
-            intensity: normalized_vol,
-            _padding: [0.0; 3],
-        };
+        let needs_resolution_update =
+            self.uniform_data.resolution != [self.size.0 as f32, self.size.1 as f32];
+
+        if needs_resolution_update {
+            self.uniform_data.resolution = [self.size.0 as f32, self.size.1 as f32];
+        }
+
+        self.uniform_data.time = elapsed;
+        self.uniform_data.intensity = normalized_vol;
+
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(&[self.uniform_data]),
+        );
 
         self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
-
-        // Clamp FFT magnitudes to keep the spikes under control
-        let safe_spectrum: Vec<f32> = current_spectrum
-            .iter()
-            .map(|&v| v.clamp(0.0, 1.0))
-            .collect();
-
-        self.queue
-            .write_buffer(&self.fft_buffer, 0, bytemuck::cast_slice(&safe_spectrum));
+            .write_buffer(&self.fft_buffer, 0, bytemuck::cast_slice(&self.smooth_fft));
 
         // 3. Render Pass
         let st = self.surface.get_current_texture();
@@ -323,6 +338,8 @@ fn setup_audio() -> Arc<Mutex<Vec<f32>>> {
         let mut magnitudes = vec![0.0f32; 256 / 2 + 1];
         let mut buf = vec![0f32; 256 * 2];
 
+        let mut mono_buf = vec![0.0f32; 256];
+
         loop {
             let buf_bytes = unsafe {
                 std::slice::from_raw_parts_mut(
@@ -336,7 +353,12 @@ fn setup_audio() -> Arc<Mutex<Vec<f32>>> {
                 break;
             }
 
-            let mut mono_buf: Vec<f32> = buf.chunks_exact(2).map(|c| (c[0] + c[1]) * 0.5).collect();
+            for (i, chunk) in buf.chunks_exact(2).enumerate() {
+                if i < mono_buf.len() {
+                    mono_buf[i] = (chunk[0] + chunk[1]) * 0.5;
+                }
+            }
+
             r2c.process(&mut mono_buf, &mut output_complex).unwrap();
 
             for (i, c) in output_complex.iter().enumerate() {
@@ -358,7 +380,6 @@ fn main() {
     let mut states: HashMap<Id, State> = HashMap::new();
     let mut last_update: HashMap<Id, std::time::Instant> = HashMap::new();
     let spectrum_source = setup_audio();
-    let mut smooth_fft = vec![];
 
     let target_fps = 45.0;
     let frame_duration = std::time::Duration::from_secs_f32(1.0 / target_fps);
@@ -423,10 +444,11 @@ fn main() {
                     }
 
                     let raw = spectrum_source.lock().unwrap().clone();
-                    update_fft(&mut smooth_fft, raw);
+
+                    state.update_fft(&raw);
 
                     if last_update.get(&id).expect("NO DATA LOL").elapsed() >= frame_duration {
-                        state.render(&smooth_fft);
+                        state.render();
                         last_update.insert(id, std::time::Instant::now());
                     }
 
@@ -438,20 +460,4 @@ fn main() {
         _ => ReturnData::None,
     })
     .unwrap();
-}
-
-fn update_fft(smoothed_fft: &mut Vec<f32>, new_data: Vec<f32>) {
-    if smoothed_fft.len() != new_data.len() {
-        *smoothed_fft = vec![0.0; new_data.len()];
-    }
-
-    for i in 0..new_data.len() {
-        let target = new_data[i];
-
-        if target > smoothed_fft[i] {
-            smoothed_fft[i] = target;
-        } else {
-            smoothed_fft[i] *= 0.92;
-        }
-    }
 }

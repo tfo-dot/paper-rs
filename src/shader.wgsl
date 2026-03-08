@@ -43,7 +43,7 @@ const GLOW_MASK: f32 = 300.0;
 fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     let res = u.resolution;
     let t   = u.time;
-    let vol = clamp(u.intensity, 0.0, 1.0); // Safe clamping
+    let vol = u.intensity;
 
     // 1. Center coordinates
     var uv = (fragCoord.xy - res * 0.5) / min(res.x, res.y);
@@ -59,6 +59,10 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
     // 3. Polar coordinates
     let angle  = atan2(uv.x, uv.y);
     let radius = length(uv);
+
+    if (radius > 1.5) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
    
     // 4. MIRRORING: Using absolute value of the angle to create symmetry
     // atan2 returns -PI to PI. abs() makes it 0 to PI on both sides.
@@ -70,8 +74,7 @@ fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
 
     // Smooth bin sampling
     let bin_f = norm_a * (u.numBins - 1.0);
-    let mag   = fft[i32(bin_f)] * 0.5;
-
+    let mag = clamp(fft[i32(bin_f)], 0.0, 1.0) * 0.5;
 
     // --- Drawing the Ring ---
     var col = vec3<f32>(0.0);
