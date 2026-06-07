@@ -6,6 +6,8 @@ use layershellev::{DispatchMessage, LayerShellEvent, RefreshRequest, ReturnData,
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use realfft::RealFftPlanner;
 
+
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -13,12 +15,13 @@ struct Uniforms {
     time: f32,
     num_bins: f32,
     intensity: f32,
-    _padding: [f32; 3], // Ensures 16-byte alignment for the GPU
+    fade_level: f32,
+    _padding: [f32; 2], // Ensures 16-byte alignment for the GPU
 }
 
 struct State {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
     surface_format: wgpu::TextureFormat,
     render_pipeline: wgpu::RenderPipeline,
@@ -29,16 +32,20 @@ struct State {
     size: (u32, u32),
     uniform_data: Uniforms,
     smooth_fft: Vec<f32>,
+    alpha_mode: wgpu::CompositeAlphaMode,
+    fade_level: f32,
 }
 
 impl State {
     async fn new(
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
         display_handle: raw_window_handle::RawDisplayHandle,
         window_handle: raw_window_handle::RawWindowHandle,
         size: (u32, u32),
     ) -> State {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-
         let surface = unsafe {
             instance
                 .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
@@ -48,18 +55,16 @@ impl State {
                 .expect("Failed to create surface")
         };
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .unwrap();
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .unwrap();
-
-        let cap = surface.get_capabilities(&adapter);
+        let cap = surface.get_capabilities(adapter);
         let surface_format = cap.formats[0];
+
+        let alpha_mode = if cap.alpha_modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else if cap.alpha_modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+            wgpu::CompositeAlphaMode::PostMultiplied
+        } else {
+            wgpu::CompositeAlphaMode::Auto
+        };
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Visualizer Bind Group Layout"),
@@ -67,7 +72,7 @@ impl State {
                 // Binding 0: Uniforms
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -181,9 +186,12 @@ impl State {
                 time: 0.0,
                 num_bins: num_bins as f32,
                 intensity: 0.0,
-                _padding: [0.0; 3],
+                fade_level: 0.0,
+                _padding: [0.0; 2],
             },
             smooth_fft,
+            alpha_mode,
+            fade_level: 0.0,
         };
 
         // Configure surface for the first time
@@ -204,7 +212,7 @@ impl State {
             format: self.surface_format,
             // Request compatibility with the sRGB-format texture view we‘re going to create later.
             view_formats: vec![self.surface_format.add_srgb_suffix()],
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
+            alpha_mode: self.alpha_mode,
             width: size.0,
             height: size.1,
             desired_maximum_frame_latency: 2,
@@ -233,6 +241,7 @@ impl State {
 
         self.uniform_data.time = elapsed;
         self.uniform_data.intensity = normalized_vol;
+        self.uniform_data.fade_level = self.fade_level;
 
         self.queue.write_buffer(
             &self.uniform_buffer,
@@ -267,7 +276,12 @@ impl State {
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color::BLACK),
+                        load: LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: self.fade_level as f64,
+                        }),
                         store: StoreOp::Store,
                     },
                 })],
@@ -305,10 +319,10 @@ fn setup_audio() -> Arc<Mutex<Vec<f32>>> {
 
     assert!(spec.is_valid());
 
-    // Request minimal latency buffering
+    // Request larger buffer fragment size (1024 frames) to reduce interrupts
     let buf_attr = BufferAttr {
         maxlength: u32::MAX,
-        fragsize: 256 * 2 * 4, // 256 frames * 2 channels * 4 bytes (f32)
+        fragsize: 1024 * 2 * 4, // 1024 frames * 2 channels * 4 bytes (f32)
         tlength: u32::MAX,
         prebuf: u32::MAX,
         minreq: u32::MAX,
@@ -336,7 +350,7 @@ fn setup_audio() -> Arc<Mutex<Vec<f32>>> {
 
         // Final frequency magnitudes
         let mut magnitudes = vec![0.0f32; 256 / 2 + 1];
-        let mut buf = vec![0f32; 256 * 2];
+        let mut buf = vec![0f32; 1024 * 2]; // 1024 stereo samples
 
         let mut mono_buf = vec![0.0f32; 256];
 
@@ -353,7 +367,8 @@ fn setup_audio() -> Arc<Mutex<Vec<f32>>> {
                 break;
             }
 
-            for (i, chunk) in buf.chunks_exact(2).enumerate() {
+            // Only process the last 256 stereo frames (most recent audio)
+            for (i, chunk) in buf[768 * 2..].chunks_exact(2).enumerate() {
                 if i < mono_buf.len() {
                     mono_buf[i] = (chunk[0] + chunk[1]) * 0.5;
                 }
@@ -377,12 +392,35 @@ fn setup_audio() -> Arc<Mutex<Vec<f32>>> {
 }
 
 fn main() {
+    let render_scale: f32 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.1, 1.0);
+
+    let target_fps: f32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(45.0)
+        .clamp(1.0, 144.0);
+
+    println!(
+        "Starting paper-rs with render scale: {} and target FPS: {}",
+        render_scale, target_fps
+    );
+
     let mut states: HashMap<Id, State> = HashMap::new();
     let mut last_update: HashMap<Id, std::time::Instant> = HashMap::new();
     let spectrum_source = setup_audio();
 
-    let target_fps = 45.0;
     let frame_duration = std::time::Duration::from_secs_f32(1.0 / target_fps);
+
+    // Initialize WGPU shared globals
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+    let device = Arc::new(device);
+    let queue = Arc::new(queue);
 
     let ev: WindowState<()> = WindowState::new("paper-rs")
         .with_allscreens()
@@ -406,7 +444,24 @@ fn main() {
                     continue;
                 }
 
-                let state = pollster::block_on(State::new(display_handle, window_handle, size));
+                // Set Wayland compositor upscaling destination
+                unit.try_set_viewport_destination(size.0 as i32, size.1 as i32);
+
+                // Scale the render target resolution
+                let scaled_size = (
+                    ((size.0 as f32) * render_scale).round() as u32,
+                    ((size.1 as f32) * render_scale).round() as u32,
+                );
+
+                let state = pollster::block_on(State::new(
+                    &instance,
+                    &adapter,
+                    device.clone(),
+                    queue.clone(),
+                    display_handle,
+                    window_handle,
+                    scaled_size,
+                ));
 
                 states.insert(unit.id(), state);
             }
@@ -426,10 +481,20 @@ fn main() {
                     let unit = ws.get_unit_with_id(id).unwrap();
                     let window_handle = unit.window_handle().unwrap().as_raw();
 
+                    unit.try_set_viewport_destination(*width as i32, *height as i32);
+                    let scaled_size = (
+                        ((*width as f32) * render_scale).round() as u32,
+                        ((*height as f32) * render_scale).round() as u32,
+                    );
+
                     let state = pollster::block_on(State::new(
+                        &instance,
+                        &adapter,
+                        device.clone(),
+                        queue.clone(),
                         display_handle,
                         window_handle,
-                        (*width, *height),
+                        scaled_size,
                     ));
                     states.insert(id, state);
                     last_update.insert(id, std::time::Instant::now());
@@ -437,22 +502,63 @@ fn main() {
 
                 // 2. Render logic
                 if let Some(state) = states.get_mut(&id) {
-                    // Ensure wgpu surface matches the new anchored size
-                    if state.size != (*width, *height) {
-                        state.size = (*width, *height);
-                        state.configure_surface((*width, *height));
+                    let unit = ws.get_unit_with_id(id).unwrap();
+                    unit.try_set_viewport_destination(*width as i32, *height as i32);
+
+                    let scaled_width = ((*width as f32) * render_scale).round() as u32;
+                    let scaled_height = ((*height as f32) * render_scale).round() as u32;
+
+                    // Ensure wgpu surface matches the new scaled size
+                    if state.size != (scaled_width, scaled_height) {
+                        state.size = (scaled_width, scaled_height);
+                        state.configure_surface((scaled_width, scaled_height));
                     }
 
                     let raw = spectrum_source.lock().unwrap().clone();
 
-                    state.update_fft(&raw);
+                    // Detect if there is audio activity (any bin > 0.02)
+                    let is_silent = raw.iter().all(|&x| x < 0.02);
 
-                    if last_update.get(&id).expect("NO DATA LOL").elapsed() >= frame_duration {
-                        state.render();
-                        last_update.insert(id, std::time::Instant::now());
+                    if !is_silent {
+                        // Fade in quickly (in ~10 frames = 0.3s)
+                        state.fade_level = (state.fade_level + 0.1).min(1.0);
+                    } else {
+                        // Fade out slowly (in ~50 frames = 1.6s)
+                        state.fade_level = (state.fade_level - 0.02).max(0.0);
                     }
 
-                    ws.request_refresh(id, RefreshRequest::NextFrame);
+                    let is_suspended = state.fade_level <= 0.0;
+
+                    if !is_suspended || state.uniform_data.fade_level > 0.0 {
+                        state.update_fft(&raw);
+
+                        let last = *last_update.get(&id).expect("NO DATA LOL");
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last) >= frame_duration {
+                            // If we just entered suspension, clear the visualizer states so they render transparently
+                            if is_suspended {
+                                state.smooth_fft.fill(0.0);
+                                state.uniform_data.intensity = 0.0;
+                            }
+                            state.render();
+                            last_update.insert(id, now);
+
+                            if is_suspended {
+                                // Just entered suspension: sleep
+                                let next_check = std::time::Instant::now() + std::time::Duration::from_millis(200);
+                                ws.request_refresh(id, RefreshRequest::At(next_check));
+                            } else {
+                                ws.request_refresh(id, RefreshRequest::NextFrame);
+                            }
+                        } else {
+                            let next_render = last + frame_duration;
+                            ws.request_refresh(id, RefreshRequest::At(next_render));
+                        }
+                    } else {
+                        // Suspended: sleep
+                        let next_check = std::time::Instant::now() + std::time::Duration::from_millis(200);
+                        ws.request_refresh(id, RefreshRequest::At(next_check));
+                    }
                 }
             }
             ReturnData::None
